@@ -2,7 +2,30 @@
 
 VNC server for Linux framebuffer devices.
 
-![workflow](https://github.com/ponty/framebuffer-vncserver/actions/workflows/main.yml/badge.svg)
+This project is tuned for framebuffer-first embedded systems where memory bandwidth,
+CPU budget, and network quality can vary a lot. The server favors predictable frame
+times and low overhead by combining lightweight change detection with selective
+quality work only where it matters.
+
+Framebuffer-focused optimizations include:
+
+- sequential framebuffer access paths and optional shadow-copy mode to reduce costly
+	random reads from `/dev/fb*` on slower systems
+- output downsampling to reduce transmitted pixel count while preserving interaction
+	responsiveness
+- nearest-neighbor (NN) paths for fast real-time updates, with higher-quality (HQ)
+	tile generation/caching to improve visual quality once content stabilizes
+- sparse/tile-based dirty detection, cache reuse, and copy-rect scheduling to avoid
+	re-sending unchanged regions
+- tunable detect/verify behavior (`-D`, `-V`) so latency and visual confidence can
+	be balanced per device/network
+
+Input handling is also hardened for less reliable links:
+
+- touch events are queued and injected asynchronously to decouple network callback
+	timing from evdev writes
+- very short taps are stretched to a minimum press duration to improve tap detection
+	on jittery WiFi/remote sessions
 
 The goal is to access remote embedded Linux systems without X.
 Implemented features: remote display, touchscreen, keyboard, rotation
@@ -51,15 +74,20 @@ Using qmake:
 
 ### command-line help 
 
-	./framebuffer-vncserver [-f device] [-p port] [-t touchscreen] [-m mouse] [-k keyboard] [-r rotation] [-R touchscreen rotation] [-F FPS] [-v] [-h]
+	./framebuffer-vncserver [-f device] [-p port] [-t touchscreen] [-m mouse] [-k keyboard] [-r rotation] [-R touchscreen rotation] [-F FPS] [-S factor] [-D step] [-V interval] [-Q] [-M] [-v] [-h]
 	-p port: VNC port, default is 5900
 	-f device: framebuffer device node, default is /dev/fb0
-	-k device: keyboard device node (example: /dev/input/event0)
+	-k device: keyboard device node (example: /dev/input/event0). If omitted/unavailable, tries /dev/uinput virtual keyboard
 	-t device: touchscreen device node (example:/dev/input/event2)
 	-m device: mouse device node (example:/dev/input/event2)
 	-r degrees: framebuffer rotation, default is 0
 	-R degrees: touchscreen rotation, default is same as framebuffer rotation
 	-F FPS: Maximum target FPS, default is 10
+	-S factor: Downsample factor for remote display (1=no downsample, 2, 4, ...), default is 4
+	-D step: Detect sampling step in output pixels (even, >=2), default is 2
+	-V interval: Full-verify interval in frames (0=disabled), default is 0
+	-Q: Enable sequential relay snapshot A/B mode for detect and NN render
+	-M: Enable raw framebuffer shadow-copy mode (copy once, process from RAM)
 	-v: verbose
 	-h: print this help
 
