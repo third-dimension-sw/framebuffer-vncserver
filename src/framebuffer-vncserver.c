@@ -874,8 +874,55 @@ int main(int argc, char **argv)
                     if (argv[i])
                         target_fps = atoi(argv[i]);
                     break;
+                case 'S':
+                    i++;
+                    if (argv[i])
+                    {
+                        int factor = atoi(argv[i]);
+                        if (factor < 1)
+                        {
+                            error_print("Invalid downsample factor %d; must be >= 1\n", factor);
+                            exit(EXIT_FAILURE);
+                        }
+                        downsample_factor = (unsigned int)factor;
+                    }
+                    break;
+                case 'D':
+                    i++;
+                    if (argv[i])
+                    {
+                        int step = atoi(argv[i]);
+                        if (step < 2)
+                        {
+                            error_print("Invalid detect step %d; must be >= 2\n", step);
+                            exit(EXIT_FAILURE);
+                        }
+                        if ((step & 1) != 0)
+                            step += 1;
+                        detect_sample_step = (unsigned int)step;
+                    }
+                    break;
+                case 'V':
+                    i++;
+                    if (argv[i])
+                    {
+                        int interval = atoi(argv[i]);
+                        if (interval < 0)
+                        {
+                            error_print("Invalid verify interval %d; must be >= 0\n", interval);
+                            exit(EXIT_FAILURE);
+                        }
+                        detect_verify_interval = (unsigned int)interval;
+                    }
+                    break;
                 case 'v':
                     verbose = 1;
+                    break;
+                case 'Q':
+                    use_sequential_dump = 1;
+                    break;
+                case 'M':
+                    use_shadow_copy = 1;
                     break;
                 }
             }
@@ -924,9 +971,27 @@ int main(int argc, char **argv)
     }
 
     info_print("Initializing VNC server:\n");
-    info_print("	width:  %d\n", (int)fb_xres);
-    info_print("	height: %d\n", (int)fb_yres);
-    info_print("	bpp:    %d\n", (int)var_scrinfo.bits_per_pixel);
+    unsigned int log_width = fb_xres / downsample_factor;
+    unsigned int log_height = fb_yres / downsample_factor;
+    if (log_width == 0)
+        log_width = 1;
+    if (log_height == 0)
+        log_height = 1;
+    if (vnc_rotate == 90 || vnc_rotate == 270)
+    {
+        unsigned int tmp = log_width;
+        log_width = log_height;
+        log_height = tmp;
+    }
+    info_print("\twidth:  %d\n", (int)log_width);
+    info_print("\theight: %d\n", (int)log_height);
+    info_print("\tsource bpp: %d\n", (int)var_scrinfo.bits_per_pixel);
+    info_print("\trelay bpp:  %d\n", 16);
+    info_print("\tdownsample factor: %d\n", (int)downsample_factor);
+    info_print("\tdetect sample step: %u\n", detect_sample_step);
+    info_print("\tverify interval: %u\n", detect_verify_interval);
+    info_print("\tsequential dump mode: %s\n", use_sequential_dump ? "enabled" : "disabled");
+    info_print("\tshadow copy mode: %s\n", use_shadow_copy ? "enabled" : "disabled");
     info_print("	port:   %d\n", (int)vnc_port);
     info_print("	rotate: %d\n", (int)vnc_rotate);
     info_print("  mouse/touch rotate: %d\n", (int)touch_rotate);
