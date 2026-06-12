@@ -208,6 +208,8 @@ static void inject_touch_event_immediate(enum MouseAction mouseAction,
     ev.code = 0;
     ev.value = 0;
     write_event_or_count_fail(&ev);
+
+    info_print("injectTouchEvent (screen(%d,%d) -> touch(%d,%d), mouse=%d)\n", xin, yin, x, y, mouseAction);
 }
 
 static void *touch_worker_main(void *opaque)
