@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include <linux/fb.h>
 #include <linux/input.h>
+#include <linux/uinput.h>
 
 #include <assert.h>
 #include <errno.h>
@@ -30,17 +31,99 @@
 
 //static char KBD_DEVICE[256] = "/dev/input/event1";
 static int kbdfd = -1;
+static int kbd_is_uinput = 0;
+
+static int init_uinput_kbd(void)
+{
+    static const char *uinput_paths[] = {
+        "/dev/uinput",
+        "/dev/input/uinput",
+    };
+    struct uinput_setup usetup;
+    const char *opened_path = NULL;
+
+    for (unsigned int i = 0; i < (sizeof(uinput_paths) / sizeof(uinput_paths[0])); i++)
+    {
+        kbdfd = open(uinput_paths[i], O_WRONLY | O_NONBLOCK);
+        if (kbdfd >= 0)
+        {
+            opened_path = uinput_paths[i];
+            break;
+        }
+    }
+
+    if (kbdfd < 0)
+    {
+        error_print("cannot open uinput devices (/dev/uinput, /dev/input/uinput): %s\n", strerror(errno));
+        return 0;
+    }
+
+    if (ioctl(kbdfd, UI_SET_EVBIT, EV_KEY) < 0 ||
+        ioctl(kbdfd, UI_SET_EVBIT, EV_SYN) < 0)
+    {
+        error_print("uinput setup failed (event bits): %s\n", strerror(errno));
+        close(kbdfd);
+        kbdfd = -1;
+        return 0;
+    }
+
+    for (int key = 0; key < KEY_MAX; key++)
+    {
+        if (ioctl(kbdfd, UI_SET_KEYBIT, key) < 0)
+        {
+            error_print("uinput setup failed (key bits): %s\n", strerror(errno));
+            close(kbdfd);
+            kbdfd = -1;
+            return 0;
+        }
+    }
+
+    memset(&usetup, 0, sizeof(usetup));
+    snprintf(usetup.name, UINPUT_MAX_NAME_SIZE, "framebuffer-vncserver-kbd");
+    usetup.id.bustype = BUS_USB;
+    usetup.id.vendor = 0x1;
+    usetup.id.product = 0x1;
+    usetup.id.version = 1;
+
+    if (ioctl(kbdfd, UI_DEV_SETUP, &usetup) < 0)
+    {
+        error_print("uinput setup failed (UI_DEV_SETUP): %s\n", strerror(errno));
+        close(kbdfd);
+        kbdfd = -1;
+        return 0;
+    }
+
+    if (ioctl(kbdfd, UI_DEV_CREATE) < 0)
+    {
+        error_print("uinput setup failed (UI_DEV_CREATE): %s\n", strerror(errno));
+        close(kbdfd);
+        kbdfd = -1;
+        return 0;
+    }
+
+    kbd_is_uinput = 1;
+    info_print("Initialized virtual keyboard via %s\n", opened_path);
+    return 1;
+}
 
 int init_kbd(const char *kbd_device)
 {
+    if (kbd_device == NULL || strlen(kbd_device) == 0)
+    {
+        info_print("No physical keyboard device specified; trying virtual keyboard via uinput ...\n");
+        return init_uinput_kbd();
+    }
+
     info_print("Initializing keyboard device %s ...\n", kbd_device);
     if ((kbdfd = open(kbd_device, O_RDWR)) == -1)
     {
         error_print("cannot open kbd device %s\n", kbd_device);
-        return 0;
+        info_print("Falling back to virtual keyboard via uinput ...\n");
+        return init_uinput_kbd();
     }
     else
     {
+        kbd_is_uinput = 0;
         return 1;
     }
 }
@@ -49,7 +132,13 @@ void cleanup_kbd()
 {
     if (kbdfd != -1)
     {
+        if (kbd_is_uinput)
+        {
+            ioctl(kbdfd, UI_DEV_DESTROY);
+            kbd_is_uinput = 0;
+        }
         close(kbdfd);
+        kbdfd = -1;
     }
 }
 
