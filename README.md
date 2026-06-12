@@ -2,6 +2,8 @@
 
 VNC server for Linux framebuffer devices.
 
+![workflow](https://github.com/third-dimension-sw/framebuffer-vncserver/actions/workflows/main.yml/badge.svg)
+
 This project is tuned for framebuffer-first embedded systems where memory bandwidth,
 CPU budget, and network quality can vary a lot. The server favors predictable frame
 times and low overhead by combining lightweight change detection with selective
