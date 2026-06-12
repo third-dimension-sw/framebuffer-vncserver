@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 #include <unistd.h>
 #include <sys/mman.h>
@@ -32,6 +33,7 @@
 
 #include <assert.h>
 #include <errno.h>
+#include <pthread.h>
 
 /* libvncserver */
 #include "rfb/rfb.h"
@@ -45,8 +47,14 @@
 /*****************************************************************************/
 #define LOG_FPS
 
-#define BITS_PER_SAMPLE 5
-#define SAMPLES_PER_PIXEL 2
+#define OUTPUT_BITS_PER_SAMPLE 5
+#define OUTPUT_SAMPLES_PER_PIXEL 3
+#define OUTPUT_BYTES_PER_PIXEL 2
+#define DIRTY_TILE_SIZE 16
+#define TILE_CACHE_FRAME_MULTIPLIER 5
+#define TILE_CACHE_MIN_ENTRIES 256
+#define TILE_BUILD_QUEUE_MULTIPLIER 2
+#define DEBUG_TILE_MODE 0
 
 // #define CHANNELS_PER_PIXEL 4
 
@@ -59,8 +67,8 @@ static struct fb_var_screeninfo var_scrinfo;
 static struct fb_fix_screeninfo fix_scrinfo;
 static int fbfd = -1;
 static unsigned short int *fbmmap = MAP_FAILED;
-static unsigned short int *vncbuf;
-static unsigned short int *fbbuf;
+static uint8_t *vncbuf;
+static uint8_t *vnc_prevbuf;
 
 static int vnc_port = 5900;
 static int vnc_rotate = 0;
@@ -72,7 +80,90 @@ static unsigned int bits_per_pixel;
 static unsigned int frame_size;
 static unsigned int fb_xres;
 static unsigned int fb_yres;
+static unsigned int relay_xres;
+static unsigned int relay_yres;
+static unsigned int relay_frame_size;
+static unsigned int relay_tile_cols;
+static unsigned int relay_tile_rows;
+static unsigned int relay_tile_count;
+static uint8_t *tile_dirty;
+static uint8_t *tile_render_from_cache;
+static uint8_t *tile_debug_corner_state;
+static struct tile_hash_t *tile_last_served_hash;
+static uint8_t *tile_last_served_valid;
+static struct tile_hash_t *tile_frame_hash;
+static struct tile_hash_t *tile_prev_frame_hash;
+static uint8_t *tile_prev_frame_hash_valid;
+static int *tile_copy_source_index;
+static int *copy_anchor_map_slot;
+static unsigned int copy_anchor_map_capacity = 0;
+static int *tile_cache_map_index;
+static uint8_t *tile_cache_map_state;
+static unsigned int tile_cache_map_capacity = 0;
+static int *tile_cache_index;
+static uint16_t *relay_nn_snapshot;
+static uint8_t *fb_shadow_front;
+static uint8_t *fb_shadow_back;
+static pthread_t fb_shadow_copy_thread;
+static int fb_shadow_copy_inflight = 0;
+static int fb_shadow_initialized = 0;
+static unsigned int downsample_factor = 4;
+static unsigned int detect_sample_step = 2;
+static unsigned int detect_verify_interval = 0;
+static int use_sequential_dump = 0;
+static int use_shadow_copy = 0;
+static int force_full_tile_refresh = 1;
+static int vsync_wait_enabled = 1;
+static uint64_t cache_use_tick = 0;
+
+typedef struct fb_shadow_copy_job_t
+{
+    const uint8_t *src;
+    uint8_t *dst;
+    size_t bytes;
+} fb_shadow_copy_job_t;
+
+static fb_shadow_copy_job_t fb_shadow_copy_job;
+
+#define CACHE_MAP_EMPTY 0
+#define CACHE_MAP_OCCUPIED 1
+#define CACHE_MAP_TOMBSTONE 2
+
+typedef struct tile_hash_t
+{
+    uint64_t h1;
+    uint64_t h2;
+} tile_hash_t;
+
+typedef struct tile_cache_entry_t
+{
+    tile_hash_t hash;
+    uint64_t last_used_tick;
+    uint16_t width;
+    uint16_t height;
+    uint8_t valid;
+    uint8_t pixels[DIRTY_TILE_SIZE * DIRTY_TILE_SIZE * OUTPUT_BYTES_PER_PIXEL];
+} tile_cache_entry_t;
+
+typedef struct tile_build_task_t
+{
+    uint16_t width;
+    uint16_t height;
+    uint16_t tile_x0;
+    uint16_t tile_y0;
+    uint16_t base_w;
+    uint16_t base_h;
+} tile_build_task_t;
+
+static tile_cache_entry_t *tile_cache;
+static tile_build_task_t *tile_build_queue;
+static unsigned int tile_cache_capacity = 0;
+static unsigned int tile_build_queue_capacity = 0;
+static unsigned int tile_build_queue_head = 0;
+static unsigned int tile_build_queue_tail = 0;
+static unsigned int tile_build_queue_count = 0;
 int verbose = 0;
+static volatile uint64_t fb_probe_sink = 0;
 
 #define UNUSED(x) (void)(x)
 
@@ -181,27 +272,33 @@ a press and release of button 5.
   From: http://www.vislab.usyd.edu.au/blogs/index.php/2009/05/22/an-headerless-indexed-protocol-for-input-1?blog=61 */
 
     debug_print("Got ptrevent: %04x (x=%d, y=%d)\n", buttonMask, x, y);
-    // Simulate left mouse event as touch event
+
+    /* VNC output is downsampled; map pointer coordinates back to source. */
+    int scaled_x = x * (int)downsample_factor;
+    int scaled_y = y * (int)downsample_factor;
+    if (scaled_x >= (int)var_scrinfo.xres)
+        scaled_x = (int)var_scrinfo.xres - 1;
+    if (scaled_y >= (int)var_scrinfo.yres)
+        scaled_y = (int)var_scrinfo.yres - 1;
+    // Simulate left mouse event as touch event.
+    // Drive state from bit-0 transitions so release is not missed when other bits are set.
     static int pressed = 0;
-    if (buttonMask & 1)
+    int primary_down = (buttonMask & 1) != 0;
+
+    if (primary_down)
     {
-        if (pressed == 1)
-        {
-            injectTouchEvent(MouseDrag, x, y, &var_scrinfo);
-        }
+        if (pressed)
+            injectTouchEvent(MouseDrag, scaled_x, scaled_y, &var_scrinfo);
         else
         {
             pressed = 1;
-            injectTouchEvent(MousePress, x, y, &var_scrinfo);
+            injectTouchEvent(MousePress, scaled_x, scaled_y, &var_scrinfo);
         }
     }
-    if (buttonMask == 0)
+    else if (pressed)
     {
-        if (pressed == 1)
-        {
-            pressed = 0;
-            injectTouchEvent(MouseRelease, x, y, &var_scrinfo);
-        }
+        pressed = 0;
+        injectTouchEvent(MouseRelease, scaled_x, scaled_y, &var_scrinfo);
     }
 }
 
@@ -218,8 +315,17 @@ a press and release of button 5.
   From: http://www.vislab.usyd.edu.au/blogs/index.php/2009/05/22/an-headerless-indexed-protocol-for-input-1?blog=61 */
 
     debug_print("Got mouse: %04x (x=%d, y=%d)\n", buttonMask, x, y);
+
+    /* VNC output is downsampled; map pointer coordinates back to source. */
+    int scaled_x = x * (int)downsample_factor;
+    int scaled_y = y * (int)downsample_factor;
+    if (scaled_x >= (int)var_scrinfo.xres)
+        scaled_x = (int)var_scrinfo.xres - 1;
+    if (scaled_y >= (int)var_scrinfo.yres)
+        scaled_y = (int)var_scrinfo.yres - 1;
+
     // Simulate left mouse event as touch event
-    injectMouseEvent(&var_scrinfo, buttonMask, x, y);
+    injectMouseEvent(&var_scrinfo, buttonMask, scaled_x, scaled_y);
 }
 
 /*****************************************************************************/
@@ -228,22 +334,126 @@ static void init_fb_server(int argc, char **argv, rfbBool enable_touch, rfbBool 
 {
     info_print("Initializing server...\n");
 
-    int rbytespp = bits_per_pixel == 1 ? 1 : bytespp;
-    int rframe_size = bits_per_pixel == 1 ? frame_size * 8 : frame_size;
+    int rbytespp = OUTPUT_BYTES_PER_PIXEL;
+    relay_xres = fb_xres / downsample_factor;
+    relay_yres = fb_yres / downsample_factor;
+    if (relay_xres == 0)
+        relay_xres = 1;
+    if (relay_yres == 0)
+        relay_yres = 1;
+
+    if (vnc_rotate == 90 || vnc_rotate == 270)
+    {
+        unsigned int tmp = relay_xres;
+        relay_xres = relay_yres;
+        relay_yres = tmp;
+    }
+
+    relay_frame_size = relay_xres * relay_yres * rbytespp;
+
     /* Allocate the VNC server buffer to be managed (not manipulated) by
      * libvncserver. */
-    vncbuf = malloc(rframe_size);
+    vncbuf = malloc(relay_frame_size);
     assert(vncbuf != NULL);
-    memset(vncbuf, bits_per_pixel == 1 ? 0xFF : 0x00, rframe_size);
+    memset(vncbuf, 0x00, relay_frame_size);
 
-    /* Allocate the comparison buffer for detecting drawing updates from frame
-     * to frame. */
-    fbbuf = calloc(frame_size, 1);
-    assert(fbbuf != NULL);
+    /* Keep previous sent frame for dirty-rectangle detection. */
+    vnc_prevbuf = malloc(relay_frame_size);
+    assert(vnc_prevbuf != NULL);
+    memcpy(vnc_prevbuf, vncbuf, relay_frame_size);
+
+    relay_tile_cols = (relay_xres + DIRTY_TILE_SIZE - 1) / DIRTY_TILE_SIZE;
+    relay_tile_rows = (relay_yres + DIRTY_TILE_SIZE - 1) / DIRTY_TILE_SIZE;
+    relay_tile_count = relay_tile_cols * relay_tile_rows;
+
+    tile_dirty = malloc(relay_tile_count);
+    tile_render_from_cache = malloc(relay_tile_count);
+    tile_debug_corner_state = malloc(relay_tile_count);
+    tile_last_served_hash = calloc(relay_tile_count, sizeof(tile_hash_t));
+    tile_last_served_valid = calloc(relay_tile_count, sizeof(uint8_t));
+    tile_frame_hash = calloc(relay_tile_count, sizeof(tile_hash_t));
+    tile_prev_frame_hash = calloc(relay_tile_count, sizeof(tile_hash_t));
+    tile_prev_frame_hash_valid = calloc(relay_tile_count, sizeof(uint8_t));
+    tile_copy_source_index = malloc(relay_tile_count * sizeof(int));
+    tile_cache_index = malloc(relay_tile_count * sizeof(int));
+
+    copy_anchor_map_capacity = 1;
+    while (copy_anchor_map_capacity < (relay_tile_count * 2))
+        copy_anchor_map_capacity <<= 1;
+    copy_anchor_map_slot = malloc(copy_anchor_map_capacity * sizeof(int));
+
+    assert(tile_dirty != NULL);
+    assert(tile_render_from_cache != NULL);
+    assert(tile_debug_corner_state != NULL);
+    assert(tile_last_served_hash != NULL);
+    assert(tile_last_served_valid != NULL);
+    assert(tile_frame_hash != NULL);
+    assert(tile_prev_frame_hash != NULL);
+    assert(tile_prev_frame_hash_valid != NULL);
+    assert(tile_copy_source_index != NULL);
+    assert(copy_anchor_map_slot != NULL);
+    assert(tile_cache_index != NULL);
+    memset(tile_dirty, 0, relay_tile_count);
+    memset(tile_render_from_cache, 0, relay_tile_count);
+    memset(tile_debug_corner_state, 0, relay_tile_count);
+    memset(tile_last_served_valid, 0, relay_tile_count);
+    memset(tile_prev_frame_hash_valid, 0, relay_tile_count);
+    memset(tile_copy_source_index, 0xFF, relay_tile_count * sizeof(int));
+    memset(copy_anchor_map_slot, 0xFF, copy_anchor_map_capacity * sizeof(int));
+    for (unsigned int i = 0; i < relay_tile_count; i++)
+        tile_cache_index[i] = -1;
+
+    tile_cache_capacity = relay_tile_count * TILE_CACHE_FRAME_MULTIPLIER;
+    if (tile_cache_capacity < TILE_CACHE_MIN_ENTRIES)
+        tile_cache_capacity = TILE_CACHE_MIN_ENTRIES;
+
+    tile_build_queue_capacity = relay_tile_count * TILE_BUILD_QUEUE_MULTIPLIER;
+    if (tile_build_queue_capacity < relay_tile_count)
+        tile_build_queue_capacity = relay_tile_count;
+
+    tile_cache_map_capacity = 1;
+    while (tile_cache_map_capacity < (tile_cache_capacity * 2))
+        tile_cache_map_capacity <<= 1;
+
+    tile_cache = calloc(tile_cache_capacity, sizeof(tile_cache_entry_t));
+    tile_build_queue = calloc(tile_build_queue_capacity, sizeof(tile_build_task_t));
+    tile_cache_map_index = malloc(tile_cache_map_capacity * sizeof(int));
+    tile_cache_map_state = calloc(tile_cache_map_capacity, sizeof(uint8_t));
+    relay_nn_snapshot = malloc(relay_xres * relay_yres * sizeof(uint16_t));
+    fb_shadow_front = malloc(frame_size);
+    fb_shadow_back = malloc(frame_size);
+    assert(tile_cache != NULL);
+    assert(tile_build_queue != NULL);
+    assert(tile_cache_map_index != NULL);
+    assert(tile_cache_map_state != NULL);
+    assert(relay_nn_snapshot != NULL);
+    assert(fb_shadow_front != NULL);
+    assert(fb_shadow_back != NULL);
+    memset(tile_cache_map_index, 0xFF, tile_cache_map_capacity * sizeof(int));
+
+    info_print("\ttile cache entries: %u (~%u frames)\n",
+               tile_cache_capacity,
+               relay_tile_count == 0 ? 0 : (tile_cache_capacity / relay_tile_count));
+
+    tile_build_queue_head = 0;
+    tile_build_queue_tail = 0;
+    tile_build_queue_count = 0;
+    cache_use_tick = 0;
 
     /* TODO: This assumes var_scrinfo.bits_per_pixel is 16. */
-    server = rfbGetScreen(&argc, argv, fb_xres, fb_yres, BITS_PER_SAMPLE, SAMPLES_PER_PIXEL, rbytespp);
+    server = rfbGetScreen(&argc, argv, relay_xres, relay_yres,
+                          OUTPUT_BITS_PER_SAMPLE, OUTPUT_SAMPLES_PER_PIXEL, rbytespp);
     assert(server != NULL);
+
+    server->serverFormat.bitsPerPixel = 16;
+    server->serverFormat.depth = 16;
+    server->serverFormat.trueColour = TRUE;
+    server->serverFormat.redMax = 31;
+    server->serverFormat.greenMax = 63;
+    server->serverFormat.blueMax = 31;
+    server->serverFormat.redShift = 11;
+    server->serverFormat.greenShift = 5;
+    server->serverFormat.blueShift = 0;
 
     server->desktopName = "framebuffer";
     server->frameBuffer = (char *)vncbuf;
